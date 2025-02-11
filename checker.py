@@ -3,15 +3,17 @@ import requests
 import time
 
 api_token = "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"
-Model = 'EleutherAI/gpt-neo-125M'
+#Model = 't5-large'
+#Model = 'EleutherAI/gpt-neo-125M'
 #Model = 'distilgpt2'
 #Model = 'google-t5/t5-small'
 #Model = 'EleutherAI/gpt-neo-2.7B'
 #Model = 'EleutherAI/gpt-neo-1.3B'
-
-
+#Model = 'facebook/bart-base'
+Model = 'bigscience/bloom'
     
 def preload_model(api_token):
+    global Model
     """
     Предварительно загружает модель, чтобы она была готова к использованию.
     
@@ -35,7 +37,7 @@ def preload_model(api_token):
 
 
 def generate_commit_message_with_retries(diff, api_token, retries=5, delay=5):
-    global model
+    global Model
     """
     Генерирует сообщение коммита с повторными попытками в случае ошибки.
     

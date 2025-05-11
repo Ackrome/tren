@@ -1,0 +1,6 @@
+MNIST/
+dataset/
+FashioMNIST/
+best_pictures/
+images/
+*.csv

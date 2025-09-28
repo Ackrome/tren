@@ -1,0 +1,398 @@
+import asyncio
+import logging
+import contextvars
+import random
+import string
+from typing import Set, Dict
+from dotenv import load_dotenv
+from os import getenv
+load_dotenv()
+
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, Response
+
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCConfiguration, RTCIceServer, MediaStreamError
+
+# Context variables for logging
+room_id_var = contextvars.ContextVar('room_id', default='-')
+client_id_var = contextvars.ContextVar('client_id', default='-')
+remote_addr_var = contextvars.ContextVar('remote_addr', default='-')
+
+# Custom logging formatter to include context
+class ContextualFormatter(logging.Formatter):
+    def format(self, record):
+        record.room_id = room_id_var.get()
+        record.client_id = client_id_var.get()
+        record.remote_addr = remote_addr_var.get()
+        return super().format(record)
+
+# Configure logging to see WebRTC events with context
+log_format = '[%(asctime)s] [%(levelname)s] [%(name)s] [room:%(room_id)s] [client:%(client_id)s] [remote:%(remote_addr)s] - %(message)s'
+formatter = ContextualFormatter(log_format)
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
+
+# Configure root logger. force=True is available in Python 3.8+ and will
+# remove any existing handlers and apply this new configuration.
+logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+
+logger = logging.getLogger(__name__)
+
+class RelayStreamTrack(MediaStreamTrack):
+    """
+    A MediaStreamTrack that gets its frames from a queue.
+    This is used for the consumer side of the relay.
+    """
+    def __init__(self, kind, source_track_id: str):
+        super().__init__()
+        self.kind = kind
+        self.source_track_id = source_track_id
+        self._ended = False
+        self._queue: asyncio.Queue = asyncio.Queue()
+
+    async def recv(self):
+        frame = await self._queue.get()
+        if frame is None:
+            raise MediaStreamError
+        return frame
+
+    async def _queue_frame(self, frame):
+        await self._queue.put(frame)
+
+    @property
+    def ended(self):
+        return self._ended
+
+    def stop(self):
+        if not self.ended:
+            self._queue.put_nowait(None)
+            self._ended = True
+        super().stop()
+
+class MediaRelay:
+    """
+    A media relay that handles fanning out a single source track to multiple consumers,
+    creating a unique consumer track for each peer.
+    """
+    def __init__(self):
+        self.source_tracks: Dict[str, MediaStreamTrack] = {}
+        self.consumer_tracks: Dict[str, Set[RelayStreamTrack]] = {}
+        self.relay_tasks: Dict[str, asyncio.Task] = {}
+
+    async def _relay_track(self, source_track: MediaStreamTrack):
+        consumer_set = self.consumer_tracks.get(source_track.id, set())
+        logger.info(f"Starting relay for track {source_track.id} to {len(consumer_set)} consumers")
+        try:
+            while True:
+                frame = await source_track.recv()
+                for consumer_track in list(consumer_set):
+                    if consumer_track.readyState == "live":
+                        await consumer_track._queue_frame(frame)
+                    else:
+                        consumer_set.remove(consumer_track)
+        except asyncio.CancelledError:
+            logger.info(f"Relay for track {source_track.id} was cancelled.")
+        except MediaStreamError:
+            logger.info(f"Relay for track {source_track.id} ended gracefully.")
+        finally:
+            self._cleanup_track(source_track.id)
+            logger.info(f"Relay for track {source_track.id} stopped and cleaned up.")
+
+    def _cleanup_track(self, track_id: str):
+        if track_id in self.consumer_tracks:
+            for consumer in self.consumer_tracks[track_id]:
+                consumer.stop()
+            del self.consumer_tracks[track_id]
+        if track_id in self.source_tracks:
+            del self.source_tracks[track_id]
+        if track_id in self.relay_tasks:
+            del self.relay_tasks[track_id]
+
+    def add_source_track(self, source_track: MediaStreamTrack):
+        if source_track.id not in self.source_tracks:
+            self.source_tracks[source_track.id] = source_track
+            self.consumer_tracks[source_track.id] = set()
+            self.relay_tasks[source_track.id] = asyncio.create_task(self._relay_track(source_track))
+
+    def remove_source_track(self, track_id: str):
+        if track_id in self.relay_tasks:
+            self.relay_tasks[track_id].cancel()
+            self._cleanup_track(track_id)
+
+    def create_consumer_track(self, source_track: MediaStreamTrack) -> RelayStreamTrack:
+        consumer_track = RelayStreamTrack(kind=source_track.kind, source_track_id=source_track.id)
+        if source_track.id in self.consumer_tracks:
+            self.consumer_tracks[source_track.id].add(consumer_track)
+        return consumer_track
+
+class Room:
+    """
+    Manages all the state for a single call room, including participants and media relays.
+    """
+    def __init__(self, room_id: str):
+        self.room_id = room_id
+        self.peers: Dict[str, RTCPeerConnection] = {}
+        self.websockets: Dict[str, WebSocket] = {}
+        self.negotiation_locks: Dict[str, asyncio.Lock] = {}
+        self.relay = MediaRelay()
+        self.track_owners: Dict[str, str] = {}
+        self.debounced_negotiations: Dict[str, asyncio.TimerHandle] = {}
+
+    async def join_and_initiate(self, client_id: str, websocket: WebSocket):
+        await websocket.accept()
+
+        # Get list of existing peers BEFORE adding the new one
+        existing_peer_ids = list(self.peers.keys())
+
+        # Notify existing peers about the new client
+        notification_coros = []
+        for other_client_id, ws in self.websockets.items():
+            notification_coros.append(
+                ws.send_json({"type": "peer_joined", "client_id": client_id})
+            )
+        if notification_coros:
+            await asyncio.gather(*notification_coros, return_exceptions=True)
+
+        self.websockets[client_id] = websocket
+        self.negotiation_locks[client_id] = asyncio.Lock()
+        
+        pc = self._create_peer_connection(client_id)
+        self.peers[client_id] = pc
+
+        # Notify the new client about existing peers
+        await websocket.send_json({
+            "type": "existing_participants",
+            "client_ids": existing_peer_ids
+        })
+
+        # Add existing tracks to the new peer connection
+        for source_track in list(self.relay.source_tracks.values()):
+            owner_id = self.track_owners.get(source_track.id)
+            if owner_id:
+                pc.addTrack(self.relay.create_consumer_track(source_track))
+
+        # Now, create and send the initial offer to the new client
+        await self._renegotiate(client_id, pc)
+        logger.info("Client joined and was sent an offer.")
+
+    async def leave(self, client_id: str):
+        logger.info("Client leaving room")
+
+        # Notify all other peers that this client has left
+        notification_coros = []
+        for other_client_id, ws in self.websockets.items():
+            if other_client_id != client_id:
+                notification_coros.append(
+                    ws.send_json({"type": "peer_left", "client_id": client_id})
+                )
+        if notification_coros:
+            await asyncio.gather(*notification_coros, return_exceptions=True)
+
+        # Now, clean up the leaving client's resources
+        pc = self.peers.pop(client_id, None)
+        if pc:
+            await pc.close()
+        self.websockets.pop(client_id, None)
+        self.negotiation_locks.pop(client_id, None)
+        handle = self.debounced_negotiations.pop(client_id, None)
+        if handle:
+            handle.cancel()
+
+    async def handle_message(self, client_id: str, data: dict):
+        pc = self.peers.get(client_id)
+        if not pc:
+            return
+
+        sdp_type = data.get("type")
+        if sdp_type == "answer":
+            answer = RTCSessionDescription(sdp=filter_sdp(data["sdp"]), type=data["type"])
+            await pc.setRemoteDescription(answer)
+        elif sdp_type == "candidate" and data.get("candidate"):
+            from aiortc.sdp import candidate_from_sdp
+            candidate = candidate_from_sdp(data["candidate"]["candidate"].split(":", 1)[1])
+            candidate.sdpMid = data["candidate"]["sdpMid"]
+            candidate.sdpMLineIndex = data["candidate"]["sdpMLineIndex"]
+            await pc.addIceCandidate(candidate)
+
+    async def _on_track_from_peer(self, client_id: str, track: MediaStreamTrack):
+        logger.info(f"Track {track.kind}:{track.id} received")
+        self.relay.add_source_track(track)
+        self.track_owners[track.id] = client_id
+
+        # Debounce renegotiation for other peers
+        loop = asyncio.get_running_loop()
+        for other_client_id, other_pc in self.peers.items():
+            if other_client_id != client_id and other_pc.connectionState != "closed":
+                logger.info(f"Adding track {track.id} to peer {other_client_id}")
+                other_pc.addTrack(self.relay.create_consumer_track(track))
+
+                # Cancel any pending renegotiation for this peer
+                if other_client_id in self.debounced_negotiations:
+                    self.debounced_negotiations[other_client_id].cancel()
+
+                # Schedule a new one, passing the client_id as an argument.
+                # This is a more robust pattern than using a closure.
+                self.debounced_negotiations[other_client_id] = loop.call_later(
+                    0.1,  # 100ms debounce window
+                    self._schedule_renegotiation,
+                    other_client_id
+                )
+
+        @track.on("ended")
+        async def on_ended():
+            logger.info(f"Track {track.kind}:{track.id} ended")
+            if track.id in self.track_owners:
+                del self.track_owners[track.id]
+            self.relay.remove_source_track(track.id)
+
+    def _schedule_renegotiation(self, client_id: str):
+        """Callback function to create the renegotiation task."""
+        asyncio.create_task(self._renegotiate_by_id(client_id))
+
+    async def _renegotiate_by_id(self, client_id: str):
+        """Helper to look up peer connection by ID and renegotiate."""
+        pc = self.peers.get(client_id)
+        if pc and pc.connectionState != "closed":
+            await self._renegotiate(client_id, pc)
+
+    async def _renegotiate(self, client_id: str, pc: RTCPeerConnection):
+        lock = self.negotiation_locks.get(client_id)
+        if not lock: return
+
+        async with lock:
+            if pc.signalingState != 'stable':
+                logger.warning(f"Skipping renegotiation, state is {pc.signalingState}")
+                return
+
+            logger.info("Creating renegotiation offer")
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+
+            # After setting the local description, the mids are assigned.
+            # Now we can send the peer_info messages.
+            for transceiver in pc.getTransceivers():
+                if transceiver.sender and transceiver.sender.track and hasattr(transceiver.sender.track, 'source_track_id'):
+                    source_track_id = transceiver.sender.track.source_track_id
+                    owner_id = self.track_owners.get(source_track_id)
+                    if owner_id:
+                        await self._send_to_peer(client_id, {
+                            "type": "peer_info",
+                            "mid": transceiver.mid,
+                            "client_id": owner_id
+                        })
+
+            await self._send_to_peer(client_id, {
+                "type": "offer", "sdp": pc.localDescription.sdp, "type": pc.localDescription.type
+            })
+
+    def _create_peer_connection(self, client_id: str) -> RTCPeerConnection:
+        config = RTCConfiguration(iceServers=[RTCIceServer(urls=[getenv("STUN_SERVER", "stun:stun.l.google.com:19302")])])
+        pc = RTCPeerConnection(configuration=config)
+
+        # Add transceivers for receiving audio and video from the client.
+        # This is crucial for the server-initiated offer to be valid.
+        pc.addTransceiver("audio", direction="recvonly")
+        pc.addTransceiver("video", direction="recvonly")
+
+        @pc.on("track")
+        async def on_track(track):
+            await self._on_track_from_peer(client_id, track)
+
+        @pc.on("icecandidate")
+        async def on_icecandidate(candidate):
+            if candidate:
+                await self._send_to_peer(client_id, {
+                    "type": "candidate",
+                    "candidate": {
+                        "candidate": candidate.candidate,
+                        "sdpMid": candidate.sdpMid,
+                        "sdpMLineIndex": candidate.sdpMLineIndex,
+                    }
+                })
+        
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            logger.info(f"Connection state is {pc.connectionState}")
+            if pc.connectionState == "failed":
+                await pc.close()
+
+        return pc
+
+    async def _send_to_peer(self, client_id: str, data: dict):
+        if client_id in self.websockets:
+            await self.websockets[client_id].send_json(data)
+
+app = FastAPI()
+rooms: Dict[str, Room] = {}
+
+@app.get("/", response_class=Response)
+async def redirect_to_random_room():
+    """Redirects the user to a randomly generated room URL."""
+    room_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    # Use a 307 Temporary Redirect to preserve the HTTP method
+    return Response(status_code=307, headers={"Location": f"/room/{room_id}"})
+
+@app.get("/room/{room_id}", response_class=HTMLResponse)
+async def get_room_page(room_id: str):
+    """Serves the client-side HTML file for a specific room."""
+    try:
+        with open("index.html", "r") as f:
+            content = f.read()
+        # Inject the STUN server from environment variables into the HTML
+        stun_server = getenv("STUN_SERVER", "stun:stun.l.google.com:19302")
+        content = content.replace('__STUN_SERVER_URL__', stun_server)
+        return HTMLResponse(content=content)
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Client HTML file (index.html) not found.</h1>", status_code=404)
+
+def filter_sdp(sdp: str) -> str:
+    """
+    Filters out the ssrc-audio-level RTP header extension from an SDP answer.
+    This is a workaround for a known issue in aiortc with Chrome where
+    it can send this header with a zero-length payload, causing a crash.
+    """
+    filtered_lines = []
+    for line in sdp.splitlines():
+        if "urn:ietf:params:rtp-hdrext:ssrc-audio-level" not in line:
+            filtered_lines.append(line)
+    return "\r\n".join(filtered_lines)
+
+@app.websocket("/ws/{room_id}/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str):
+    # Set context variables for logging
+    room_id_var.set(room_id)
+    client_id_var.set(client_id)
+    remote_addr_var.set(f"{websocket.client.host}:{websocket.client.port}")
+
+    if room_id not in rooms:
+        rooms[room_id] = Room(room_id)
+    room = rooms[room_id]
+
+    # The server will now initiate the connection by sending an offer
+    await room.join_and_initiate(client_id, websocket)
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if data.get("type") == "leave":
+                logger.info("Received leave message from client.")
+                break
+            await room.handle_message(client_id, data)
+    except WebSocketDisconnect:
+        logger.info("Client disconnected unexpectedly.")
+    finally:
+        logger.info("Cleaning up connection for client.")
+        await room.leave(client_id)
+        # Check if the room is now empty and should be removed
+        if room_id in rooms and not rooms[room_id].peers:
+            logger.info(f"Room {room_id} is now empty, removing it.")
+            del rooms[room_id]
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Clean up resources on server shutdown."""
+    logger.info("Server shutting down, closing all rooms.")
+    coros = [room.leave(client_id) for room in rooms.values() for client_id in list(room.peers.keys())]
+    await asyncio.gather(*coros, return_exceptions=True)
+    rooms.clear()

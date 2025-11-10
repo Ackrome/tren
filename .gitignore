@@ -5,3 +5,4 @@ best_pictures/
 images/
 *.csv
 leetcode_problems.json
+.venv/
